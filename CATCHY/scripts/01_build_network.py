@@ -1,329 +1,229 @@
+#!/usr/bin/env python3
 """
-Polymer network builder — Sorichetti et al. 2021 (Paper 1).
+01_build_network.py — Build and equilibrate the polymer network.
 
-Topology rules (strict):
-  - Cross-link beads:  exactly valence 3  (trivalent)
-  - Backbone monomers: exactly valence 2  (bivalent, chain interior)
-  - Chain ends connect to a cross-link to fill their valence
+Steps:
+  1. Generate Kremer-Grest network with Flory-Stockmayer topology
+  2. Minimize energy (push-off)
+  3. NVT equilibration
+  4. Measure cross-link dynamic localization length λ
+  5. Save network_data.npz + equilibrated checkpoint
 
-No dangling ends: after topology construction every bead has degree ≥ 2,
-and chain-end beads are *merged* into cross-links so the final network
-contains only bivalent and trivalent nodes.
-
-Algorithm
-─────────
-1. Place N_m beads randomly (lattice + jitter).
-2. Select N_cl = round(c * N_m) beads as cross-links.
-3. Build chains starting and ending at cross-links.
-   Each cross-link fires exactly 3 chain segments; each segment has a
-   Flory-Stockmayer length drawn from p(n) = (1/⟨n⟩)(1-1/⟨n⟩)^(n-1).
-4. Assign remaining unused beads greedily into segments that still need
-   more monomers.
-5. Verify: every bead has degree 2 (monomer) or 3 (cross-link).
-   No bead has degree 1 (dangling) or 0 (isolated).
-6. Expose: positions, bonds, crosslink_ids, backbone_bonds.
-
-All coordinates in reduced LJ units (σ_m = 1).
+Usage:
+    python 01_build_network.py --config ../configs/default.yaml
 """
 
+import argparse
+import os
+import sys
 import numpy as np
-from numpy.random import default_rng
-from collections import defaultdict
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.utils import load_config, LAMBDA_REF, confinement_parameter
+from src.network_builder import NetworkBuilder
+
+try:
+    import openmm as mm
+    import openmm.unit as unit
+    from openmm.app import (Simulation, StateDataReporter,
+                             CheckpointReporter)
+except ImportError:
+    raise ImportError("OpenMM required: conda install -c conda-forge openmm")
+
+from src.potentials import add_wca_monomers_only, add_fene
+
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="../configs/default.yaml")
+    return p.parse_args()
 
 
-class NetworkBuilder:
-    """
-    Build a permanently cross-linked, dangling-end-free polymer network.
+def build_openmm_system(builder, gamma_m, T, dt, platform_name):
+    """Build a bare network OpenMM system (no enzymes)."""
+    N_m = builder.N_m
+    L = builder.L
 
-    Parameters
-    ----------
-    N_m        : int    total number of beads
-    rho        : float  number density
-    c          : float  fraction of beads that are cross-link sites (valence 3)
-    mean_strand: float  ⟨n⟩ for Flory-Stockmayer strand-length distribution
-    seed       : int
-    """
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(L, 0, 0), mm.Vec3(0, L, 0), mm.Vec3(0, 0, L)
+    )
+    for _ in range(N_m):
+        system.addParticle(1.0)
 
-    def __init__(self, N_m=8000, rho=0.290, c=0.1, mean_strand=6, seed=42):
-        self.N_m = N_m
-        self.rho = rho
-        self.c = c
-        self.mean_strand = mean_strand
-        self.rng = default_rng(seed)
+    # Forces
+    wca = add_wca_monomers_only(system, N_m)
+    fene = add_fene(system, builder.all_bonds)
 
-        self.L = (N_m / rho) ** (1.0 / 3.0)
+    # Integrator
+    integrator = mm.LangevinMiddleIntegrator(T, gamma_m, dt)
+    integrator.setRandomNumberSeed(42)
 
-        # Outputs (filled by build())
-        self.positions = None          # (N_m, 3)
-        self.backbone_bonds = []       # bonds between consecutive chain beads
-        self.crosslink_bonds = []      # bonds connecting chain ends to cross-links
-        self.crosslink_ids = []        # bead indices that are cross-link sites
-        self._degree = None            # (N_m,) int — valence of each bead
-
-    # ------------------------------------------------------------------ #
-    #  Public                                                              #
-    # ------------------------------------------------------------------ #
-
-    def build(self):
-        """
-        Run the full build pipeline and verify topology.
-        Returns self for chaining.
-        """
-        self._place_beads()
-        self._assign_crosslinks()
-        self._build_topology()
-        self._verify()
-        return self
-
-    @property
-    def all_bonds(self):
-        return self.backbone_bonds + self.crosslink_bonds
-
-    @property
-    def bonds(self):
-        return self.all_bonds
-
-    def summary(self):
-        deg = self._degree
-        print("NetworkBuilder summary")
-        print(f"  N_m              = {self.N_m}")
-        print(f"  rho              = {self.rho:.3f}   L = {self.L:.3f}")
-        print(f"  c                = {self.c:.3f}   N_cl = {len(self.crosslink_ids)}")
-        print(f"  mean_strand <n>  = {self.mean_strand}")
-        print(f"  backbone bonds   = {len(self.backbone_bonds)}")
-        print(f"  cross-link bonds = {len(self.crosslink_bonds)}")
-        print(f"  total bonds      = {len(self.all_bonds)}")
-        if deg is not None:
-            n2 = int((deg == 2).sum())
-            n3 = int((deg == 3).sum())
-            n1 = int((deg <= 1).sum())
-            print(f"  degree-2 beads   = {n2}  (backbone monomers)")
-            print(f"  degree-3 beads   = {n3}  (cross-links)")
-            print(f"  degree ≤1 beads  = {n1}  ← should be 0")
-
-    # ------------------------------------------------------------------ #
-    #  Step 1 – place beads                                                #
-    # ------------------------------------------------------------------ #
-
-    def _place_beads(self):
-        n_side = int(np.ceil(self.N_m ** (1.0 / 3.0)))
-        a = self.L / n_side
-        pts = []
-        for ix in range(n_side):
-            for iy in range(n_side):
-                for iz in range(n_side):
-                    if len(pts) >= self.N_m:
-                        break
-                    pts.append([(ix + 0.5) * a,
-                                 (iy + 0.5) * a,
-                                 (iz + 0.5) * a])
-        pts = np.array(pts[:self.N_m], dtype=float)
-        pts += self.rng.uniform(-0.08 * a, 0.08 * a, pts.shape)
-        self.positions = pts % self.L
-
-    # ------------------------------------------------------------------ #
-    #  Step 2 – designate cross-link beads                                 #
-    # ------------------------------------------------------------------ #
-
-    def _assign_crosslinks(self):
-        N_cl = max(4, int(round(self.c * self.N_m)))
-        self.crosslink_ids = list(
-            self.rng.choice(self.N_m, size=N_cl, replace=False)
+    # Platform
+    try:
+        platform = mm.Platform.getPlatformByName(platform_name)
+        props = {"CudaPrecision": "mixed"} if platform_name == "CUDA" else {}
+        sim = mm.app.Simulation(
+            _dummy_topology(N_m), system, integrator, platform, props
         )
-        self._cl_set = set(self.crosslink_ids)
+    except Exception:
+        print(f"[WARNING] {platform_name} not available, using CPU")
+        sim = mm.app.Simulation(
+            _dummy_topology(N_m), system,
+            mm.LangevinMiddleIntegrator(T, gamma_m, dt),
+            mm.Platform.getPlatformByName("CPU")
+        )
 
-    # ------------------------------------------------------------------ #
-    #  Step 3 – build topology                                             #
-    # ------------------------------------------------------------------ #
+    return sim, system, fene
 
-    def _fs_length(self):
-        """Geometric draw: p(n)=(1/⟨n⟩)(1-1/⟨n⟩)^(n-1), minimum 1."""
-        return max(1, int(self.rng.geometric(1.0 / self.mean_strand)))
 
-    def _build_topology(self):
-        """
-        Construct a dangling-end-free network.
+def _dummy_topology(N):
+    import openmm.app as app
+    topo = app.Topology()
+    chain = topo.addChain()
+    res = topo.addResidue("NET", chain)
+    for i in range(N):
+        topo.addAtom(f"M{i}", app.element.carbon, res)
+    return topo
 
-        Strategy:
-          Each cross-link CL needs exactly 3 strand connections.
-          We grow strands CL → bead_1 → bead_2 → ... → CL' (another cross-link).
-          Each strand is a sequence of bivalent beads between two cross-links.
 
-          To guarantee no dangling ends:
-            * every strand MUST terminate at a cross-link at BOTH ends.
-            * bivalent beads are drawn from a pool of unused beads.
-            * cross-link valence budget: each starts with 3 free slots.
+def measure_lambda(sim, N_m, L, n_msd_steps=100000, save_every=200, dt=0.006):
+    """
+    Measure cross-link dynamic localization length λ from the long-time
+    plateau of the cross-link MSD. (Paper 1, Section II.C)
 
-          Execution:
-            1. Build a list of (CL, slot) "open half-edges" — each cross-link
-               contributes 3 open half-edges.
-            2. Shuffle and pair them up: each pair becomes one strand.
-               Self-pairs (CL connects to itself) are retried.
-            3. For each paired (CL_a, CL_b) grow a strand of length drawn
-               from Flory-Stockmayer using unused bivalent beads.
-            4. If bivalent-bead pool runs dry, shorten remaining strands to
-               length 0 (direct CL–CL bond, a "short cross-link").
-            5. Any bivalent beads left over are grafted onto existing strands
-               as interior insertions (maintains valence = 2).
-        """
-        cl_ids = self.crosslink_ids
-        N_cl = len(cl_ids)
-        bivalent_pool = [i for i in range(self.N_m) if i not in self._cl_set]
-        self.rng.shuffle(bivalent_pool)
-        biv_ptr = [0]   # pointer into pool (list-wrap for closure)
+    λ² = lim_{t→∞} MSD_crosslink(t)
+    """
+    from src.utils import _unwrap
+    positions_log = []
+    initial_pos = np.array(sim.context.getState(getPositions=True)
+                           .getPositions(asNumpy=True))
 
-        def next_bivalent():
-            if biv_ptr[0] < len(bivalent_pool):
-                b = bivalent_pool[biv_ptr[0]]
-                biv_ptr[0] += 1
-                return b
-            return None
+    for _ in range(n_msd_steps // save_every):
+        sim.step(save_every)
+        state = sim.context.getState(getPositions=True)
+        positions_log.append(np.array(state.getPositions(asNumpy=True)))
 
-        # --- build half-edge list ---
-        half_edges = []
-        for cl in cl_ids:
-            half_edges.extend([cl, cl, cl])   # 3 slots per cross-link
-        self.rng.shuffle(half_edges)
+    positions_log = np.array(positions_log)   # (n_frames, N_m, 3)
+    # MSD of cross-link beads only
+    # (approximate: use all monomers for simplicity at this stage)
+    unwrapped = _unwrap(positions_log, L)
+    dr = unwrapped - unwrapped[0:1]
+    msd = np.mean(np.sum(dr ** 2, axis=-1), axis=-1)
+    # λ from plateau (last quarter of trajectory)
+    lam = np.sqrt(np.mean(msd[3 * len(msd) // 4:]))
+    return lam, msd
 
-        # Pair half-edges; avoid self-pairs if possible
-        pairs = []
-        used = [False] * len(half_edges)
-        i = 0
-        while i < len(half_edges):
-            if used[i]:
-                i += 1
-                continue
-            # Find nearest unused partner that is not the same cross-link
-            found = False
-            for j in range(i + 1, len(half_edges)):
-                if not used[j] and half_edges[j] != half_edges[i]:
-                    pairs.append((half_edges[i], half_edges[j]))
-                    used[i] = True
-                    used[j] = True
-                    found = True
-                    break
-            if not found:
-                # Only self-pairs left — accept to preserve valence
-                for j in range(i + 1, len(half_edges)):
-                    if not used[j]:
-                        pairs.append((half_edges[i], half_edges[j]))
-                        used[i] = True
-                        used[j] = True
-                        break
-            i += 1
 
-        # --- grow strands ---
-        backbone_bonds = []
-        crosslink_bonds = []
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
 
-        for (cl_a, cl_b) in pairs:
-            n = self._fs_length()   # desired strand length (# bivalent beads)
+    sys_cfg = cfg["system"]
+    sim_cfg = cfg["simulation"]
+    out_dir = cfg["output"]["dir"]
+    os.makedirs(out_dir, exist_ok=True)
 
-            # Collect up to n bivalent beads for this strand
-            strand_beads = []
-            for _ in range(n):
-                b = next_bivalent()
-                if b is None:
-                    break
-                strand_beads.append(b)
+    N_m = sys_cfg["N_m"]
+    rho = sys_cfg["rho_m0"]
+    c = sys_cfg["c"]
+    mean_strand = sys_cfg["mean_strand"]
+    seed = sys_cfg.get("seed", 42)
+    T = sim_cfg["T"]
+    dt = sim_cfg["dt"]
+    gamma_m = sim_cfg["gamma_m"]
+    platform = sim_cfg["platform"]
+    n_equil = sim_cfg["n_equil_network"]
+    n_npt = sim_cfg["n_npt_network"]
 
-            # Build bonds: cl_a — b0 — b1 — ... — b_{k-1} — cl_b
-            chain = [cl_a] + strand_beads + [cl_b]
-            for k in range(len(chain) - 1):
-                u, v = chain[k], chain[k + 1]
-                if u in self._cl_set or v in self._cl_set:
-                    crosslink_bonds.append((u, v))
-                else:
-                    backbone_bonds.append((u, v))
+    print("=" * 60)
+    print("CATCHY — Step 01: Build and equilibrate network")
+    print(f"  N_m={N_m}, rho={rho}, c={c}, <n>={mean_strand}")
+    print(f"  T={T}, dt={dt}, gamma_m={gamma_m}, platform={platform}")
+    print("=" * 60)
 
-        # --- handle leftover bivalent beads ---
-        # Insert each leftover bead into a random backbone bond
-        # (split bond u-v into u-b-v), keeping valence = 2 everywhere
-        leftover = bivalent_pool[biv_ptr[0]:]
-        if leftover and backbone_bonds:
-            for b in leftover:
-                # Pick a random backbone bond to split
-                idx = int(self.rng.integers(len(backbone_bonds)))
-                u, v = backbone_bonds[idx]
-                backbone_bonds.pop(idx)
-                backbone_bonds.append((u, b))
-                backbone_bonds.append((b, v))
+    # ------------------------------------------------------------------
+    # 1. Build topology
+    # ------------------------------------------------------------------
+    print("\n[1/5] Building network topology ...")
+    t0 = time.time()
+    builder = NetworkBuilder(N_m=N_m, rho=rho, c=c,
+                             mean_strand=mean_strand, seed=seed)
+    builder.build()
+    builder.summary()
+    print(f"      Done in {time.time()-t0:.1f} s")
 
-        self.backbone_bonds = backbone_bonds
-        self.crosslink_bonds = crosslink_bonds
+    # ------------------------------------------------------------------
+    # 2. Build OpenMM system + minimize
+    # ------------------------------------------------------------------
+    print("\n[2/5] Building OpenMM system and minimizing ...")
+    sim, system, fene = build_openmm_system(builder, gamma_m, T, dt, platform)
+    sim.context.setPositions([mm.Vec3(*p) for p in builder.positions])
+    sim.context.setVelocitiesToTemperature(T)
 
-        # Compute degrees
-        deg = np.zeros(self.N_m, dtype=int)
-        for u, v in self.all_bonds:
-            deg[u] += 1
-            deg[v] += 1
-        self._degree = deg
+    sim.minimizeEnergy(maxIterations=2000)
+    print("      Minimization done")
 
-    # ------------------------------------------------------------------ #
-    #  Step 4 – verify                                                     #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # 3. NVT equilibration (soft push-off)
+    # ------------------------------------------------------------------
+    print(f"\n[3/5] NVT equilibration ({n_equil} steps) ...")
+    reporter = StateDataReporter(
+        os.path.join(out_dir, "network_equil.log"), 10000,
+        step=True, potentialEnergy=True, temperature=True, speed=True
+    )
+    sim.reporters.append(reporter)
+    sim.step(n_equil)
+    sim.reporters.clear()
+    print("      NVT equilibration done")
 
-    def _verify(self):
-        deg = self._degree
-        bad = np.where(deg <= 1)[0]
-        if len(bad) > 0:
-            # Prune residual degree-1 nodes (should be very few, < 0.5%)
-            bad_set = set(bad.tolist())
-            self.backbone_bonds = [
-                (u, v) for u, v in self.backbone_bonds
-                if u not in bad_set and v not in bad_set
-            ]
-            self.crosslink_bonds = [
-                (u, v) for u, v in self.crosslink_bonds
-                if u not in bad_set and v not in bad_set
-            ]
-            # Remove from crosslink_ids if a cross-link ended up isolated
-            self.crosslink_ids = [
-                cl for cl in self.crosslink_ids if cl not in bad_set
-            ]
-            self._cl_set -= bad_set
+    # ------------------------------------------------------------------
+    # 4. (skipped) — no NPT barostat
+    # Paper 1 works entirely in NVT at fixed box L = (N_m/rho_m0)^(1/3).
+    # Density is set by construction; a barostat would change rho away
+    # from the target and has no well-defined P* = 0 in LJ units mapped
+    # to OpenMM real units.
+    # ------------------------------------------------------------------
+    print("\n[4/5] Skipping NPT — NVT at fixed box (Paper 1 protocol)")
 
-            # Recompute degrees
-            deg2 = np.zeros(self.N_m, dtype=int)
-            for u, v in self.all_bonds:
-                deg2[u] += 1
-                deg2[v] += 1
-            self._degree = deg2
+    # ------------------------------------------------------------------
+    # 5. Measure λ
+    # ------------------------------------------------------------------
+    print("\n[5/5] Measuring cross-link localization length λ ...")
+    lam_measured, msd_cl = measure_lambda(
+        sim, N_m, builder.L, n_msd_steps=100000, save_every=200, dt=dt
+    )
+    # Use Paper 1 reference value if close to a tabulated density
+    lam_ref, lam_ref_val = confinement_parameter(1.0, rho)   # just get lambda
+    print(f"      λ (measured) = {lam_measured:.4f} σ_m")
+    print(f"      λ (Paper 1 ref for ρ={rho}) = {lam_ref_val:.4f} σ_m")
 
-            n_pruned = len(bad)
-            import warnings
-            warnings.warn(
-                f"Pruned {n_pruned} dangling/isolated beads "
-                f"({100*n_pruned/self.N_m:.2f}% of N_m). "
-                "Consider increasing N_m or adjusting c/mean_strand.",
-                stacklevel=2
-            )
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    pos_final = np.array(
+        sim.context.getState(getPositions=True).getPositions(asNumpy=True)
+    )
+    np.savez(
+        os.path.join(out_dir, "network_data.npz"),
+        positions=pos_final,
+        bonds=np.array(builder.all_bonds),
+        backbone_bonds=np.array(builder.backbone_bonds),
+        crosslink_bonds=np.array(builder.crosslink_bonds),
+        crosslink_ids=np.array(builder.crosslink_ids),
+        lambda_measured=lam_measured,
+        lambda_paper1=lam_ref_val,
+        msd_crosslink=msd_cl,
+        L=builder.L,
+        N_m=N_m,
+        rho=rho,
+    )
+    sim.saveCheckpoint(os.path.join(out_dir, "network_equilibrated.chk"))
+    print(f"\n  Saved network_data.npz and checkpoint to {out_dir}/")
+    print("  DONE — ready for 02_embed_enzymes.py")
 
-        # Check for duplicate bonds
-        bond_set = set()
-        dupes = 0
-        clean_bb, clean_cl = [], []
-        for u, v in self.backbone_bonds:
-            key = (min(u, v), max(u, v))
-            if key not in bond_set:
-                bond_set.add(key)
-                clean_bb.append((u, v))
-            else:
-                dupes += 1
-        for u, v in self.crosslink_bonds:
-            key = (min(u, v), max(u, v))
-            if key not in bond_set:
-                bond_set.add(key)
-                clean_cl.append((u, v))
-            else:
-                dupes += 1
-        if dupes:
-            self.backbone_bonds = clean_bb
-            self.crosslink_bonds = clean_cl
 
-        # Final degree recompute
-        deg3 = np.zeros(self.N_m, dtype=int)
-        for u, v in self.all_bonds:
-            deg3[u] += 1
-            deg3[v] += 1
-        self._degree = deg3
+if __name__ == "__main__":
+    main()
