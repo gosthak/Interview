@@ -20,9 +20,9 @@ simulation:
   T: 1.0                  # temperature (kBT = 1)
   dt: 0.006               # timestep (LJ units, Paper 1 value)
   gamma_m: 0.1            # monomer Langevin friction
-  n_equil_network: 500000  # network equilibration steps
-  n_npt_network: 200000    # NPT pressure equilibration steps
-  n_equil_enzyme: 300000   # enzyme push-off + equilibration steps
+  n_equil_network: 500000  # NVT equilibration of bare network (fixed box)
+  n_npt_enzyme: 50000    # NPT after enzyme insertion (P*=0, restore rho_m0)
+  n_equil_enzyme: 300000   # NVT after NPT
   n_production: 3000000    # production steps
   save_interval: 1000      # frames saved every N steps
   platform: CUDA          # CUDA / OpenCL / CPU
