@@ -3,12 +3,14 @@
 01_build_network.py — Build and equilibrate the polymer network.
 
 Steps:
-  1. Generate Kremer-Grest network with Flory-Stockmayer topology
-  2. Minimize energy (push-off)
-  3. NPT equilibration at target pressure (let box relax to rho_target)
-  4. NVT equilibration
-  5. Measure cross-link dynamic localization length λ
-  6. Save network_data.npz + equilibrated checkpoint
+  1. Generate network topology (NetworkBuilder)
+  2. Build OpenMM system with FENE bonds
+     - positions are unwrapped inside NetworkBuilder so bonds are
+       close WITHOUT PBC (required by CustomBondForce)
+  3. Energy minimization
+  4. NVT equilibration (staged dt ramp)
+  5. Measure cross-link localization length λ
+  6. Save network_data.npz + checkpoint
 
 Usage:
     python 01_build_network.py --config ../configs/default.yaml
@@ -23,18 +25,15 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.utils import load_config, LAMBDA_REF, confinement_parameter
 from src.network_builder import NetworkBuilder
+from src.potentials import add_wca_monomers_only, add_fene
 
 try:
     import openmm as mm
+    import openmm.app as app
     import openmm.unit as unit
-    from openmm.app import (Simulation, StateDataReporter,
-                             CheckpointReporter)
 except ImportError:
     raise ImportError("OpenMM required: conda install -c conda-forge openmm")
 
-from src.potentials import add_wca_monomers_only, add_fene
-
-# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -42,46 +41,7 @@ def parse_args():
     return p.parse_args()
 
 
-def build_openmm_system(builder, gamma_m, T, dt, platform_name):
-    """Build a bare network OpenMM system (no enzymes)."""
-    N_m = builder.N_m
-    L = builder.L
-
-    system = mm.System()
-    system.setDefaultPeriodicBoxVectors(
-        mm.Vec3(L, 0, 0), mm.Vec3(0, L, 0), mm.Vec3(0, 0, L)
-    )
-    for _ in range(N_m):
-        system.addParticle(1.0)
-
-    # Forces
-    wca = add_wca_monomers_only(system, N_m)
-    fene = add_fene(system, builder.all_bonds)
-
-    # Integrator
-    integrator = mm.LangevinMiddleIntegrator(T, gamma_m, dt)
-    integrator.setRandomNumberSeed(42)
-
-    # Platform
-    try:
-        platform = mm.Platform.getPlatformByName(platform_name)
-        props = {"CudaPrecision": "mixed"} if platform_name == "CUDA" else {}
-        sim = mm.app.Simulation(
-            _dummy_topology(N_m), system, integrator, platform, props
-        )
-    except Exception:
-        print(f"[WARNING] {platform_name} not available, using CPU")
-        sim = mm.app.Simulation(
-            _dummy_topology(N_m), system,
-            mm.LangevinMiddleIntegrator(T, gamma_m, dt),
-            mm.Platform.getPlatformByName("CPU")
-        )
-
-    return sim, system, fene
-
-
-def _dummy_topology(N):
-    import openmm.app as app
+def dummy_topology(N):
     topo = app.Topology()
     chain = topo.addChain()
     res = topo.addResidue("NET", chain)
@@ -90,54 +50,79 @@ def _dummy_topology(N):
     return topo
 
 
-def measure_lambda(sim, N_m, L, n_msd_steps=100000, save_every=200, dt=0.006):
-    """
-    Measure cross-link dynamic localization length λ from the long-time
-    plateau of the cross-link MSD. (Paper 1, Section II.C)
+def make_simulation(N, L, bonds, gamma_m, T, dt, platform_name):
+    """Build OpenMM system + simulation from scratch."""
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(L, 0, 0), mm.Vec3(0, L, 0), mm.Vec3(0, 0, L)
+    )
+    for _ in range(N):
+        system.addParticle(1.0)
 
-    λ² = lim_{t→∞} MSD_crosslink(t)
-    """
+    wca  = add_wca_monomers_only(system, N)
+    fene = add_fene(system, bonds)
+
+    integrator = mm.LangevinMiddleIntegrator(T, gamma_m, dt)
+    integrator.setRandomNumberSeed(42)
+
+    try:
+        platform = mm.Platform.getPlatformByName(platform_name)
+        props = {"CudaPrecision": "mixed"} if platform_name == "CUDA" else {}
+        sim = app.Simulation(dummy_topology(N), system, integrator, platform, props)
+    except Exception:
+        print(f"  [{platform_name} unavailable, using CPU]")
+        sim = app.Simulation(
+            dummy_topology(N), system,
+            mm.LangevinMiddleIntegrator(T, gamma_m, dt),
+            mm.Platform.getPlatformByName("CPU")
+        )
+    return sim, system, fene
+
+
+def check_energy(sim, label=""):
+    state = sim.context.getState(getEnergy=True)
+    e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    import math
+    ok = not (math.isnan(e) or math.isinf(e))
+    print(f"  E {label}: {e:.2f} kJ/mol  {'OK' if ok else '<<< NaN/Inf !!!'}")
+    return ok, e
+
+
+def measure_lambda(sim, N, L, n_steps=80000, save_every=200, dt=0.006):
+    """Measure cross-link localization length from MSD plateau."""
     from src.utils import _unwrap
     positions_log = []
-    initial_pos = np.array(sim.context.getState(getPositions=True)
-                           .getPositions(asNumpy=True))
-
-    for _ in range(n_msd_steps // save_every):
+    for _ in range(n_steps // save_every):
         sim.step(save_every)
         state = sim.context.getState(getPositions=True)
-        positions_log.append(np.array(state.getPositions(asNumpy=True)))
-
-    positions_log = np.array(positions_log)   # (n_frames, N_m, 3)
-    # MSD of cross-link beads only
-    # (approximate: use all monomers for simplicity at this stage)
+        pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        positions_log.append(pos)
+    positions_log = np.array(positions_log)
     unwrapped = _unwrap(positions_log, L)
     dr = unwrapped - unwrapped[0:1]
-    msd = np.mean(np.sum(dr ** 2, axis=-1), axis=-1)
-    # λ from plateau (last quarter of trajectory)
-    lam = np.sqrt(np.mean(msd[3 * len(msd) // 4:]))
+    msd = np.mean(np.sum(dr**2, axis=-1), axis=-1)
+    lam = float(np.sqrt(np.mean(msd[3*len(msd)//4:])))
     return lam, msd
 
 
 def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-
+    args  = parse_args()
+    cfg   = load_config(args.config)
     sys_cfg = cfg["system"]
     sim_cfg = cfg["simulation"]
     out_dir = cfg["output"]["dir"]
     os.makedirs(out_dir, exist_ok=True)
 
-    N_m = sys_cfg["N_m"]
-    rho = sys_cfg["rho_m0"]
-    c = sys_cfg["c"]
+    N_m      = sys_cfg["N_m"]
+    rho      = sys_cfg["rho_m0"]
+    c        = sys_cfg["c"]
     mean_strand = sys_cfg["mean_strand"]
-    seed = sys_cfg.get("seed", 42)
-    T = sim_cfg["T"]
-    dt = sim_cfg["dt"]
-    gamma_m = sim_cfg["gamma_m"]
+    seed     = sys_cfg.get("seed", 42)
+    T        = sim_cfg["T"]
+    dt       = sim_cfg["dt"]
+    gamma_m  = sim_cfg["gamma_m"]
     platform = sim_cfg["platform"]
-    n_equil = sim_cfg["n_equil_network"]
-    # NPT не используется при построении сети (бокс фиксирован)
+    n_equil  = sim_cfg["n_equil_network"]
 
     print("=" * 60)
     print("CATCHY — Step 01: Build and equilibrate network")
@@ -156,73 +141,118 @@ def main():
     builder.summary()
     print(f"      Done in {time.time()-t0:.1f} s")
 
+    N   = builder.N_m   # may be less than N_m after pruning
+    L   = builder.L
+    pos = builder.positions   # unwrapped by NetworkBuilder
+
+    # Verify no bonds exceed R0 without PBC
+    bl = builder._bond_lengths()
+    n_bad = int((bl >= 1.5).sum())
+    print(f"\n  Bond check (unwrapped): min={bl.min():.4f}  max={bl.max():.4f}  "
+          f"bonds>=R0: {n_bad}  ← should be 0")
+    if n_bad > 0:
+        print("  WARNING: some bonds still >= R0. Attempting to fix...")
+        # Last resort: nudge atoms toward each other
+        for idx, (i, j) in enumerate(builder.all_bonds):
+            dr = pos[i] - pos[j]
+            r = np.linalg.norm(dr)
+            if r >= 1.5:
+                pos[i] = pos[i] - 0.4 * dr / r
+                pos[j] = pos[j] + 0.4 * dr / r
+
     # ------------------------------------------------------------------
-    # 2. Build OpenMM system + minimize
+    # 2. Build OpenMM system
     # ------------------------------------------------------------------
-    print("\n[2/5] Building OpenMM system and minimizing ...")
-    sim, system, fene = build_openmm_system(builder, gamma_m, T, dt, platform)
-    sim.context.setPositions([mm.Vec3(*p) for p in builder.positions])
+    print("\n[2/5] Building OpenMM system ...")
+    sim, system, fene = make_simulation(
+        N, L, builder.all_bonds, gamma_m, T, dt, platform
+    )
+    sim.context.setPositions([mm.Vec3(*p) for p in pos])
+    ok, _ = check_energy(sim, "before minimization")
+    print("      System built")
+
+    # ------------------------------------------------------------------
+    # 3. Minimization
+    # ------------------------------------------------------------------
+    print("\n[3/5] Energy minimization ...")
+    sim.minimizeEnergy(maxIterations=10000)
+    ok, _ = check_energy(sim, "after minimization")
+    if not ok:
+        raise RuntimeError("Energy is NaN after minimization. Check topology.")
+
     sim.context.setVelocitiesToTemperature(T)
 
-    sim.minimizeEnergy(maxIterations=2000)
-    print("      Minimization done")
+    # ------------------------------------------------------------------
+    # 4. NVT equilibration — staged dt ramp
+    # ------------------------------------------------------------------
+    print(f"\n[4/5] NVT equilibration ({n_equil} steps) ...")
 
-    # ------------------------------------------------------------------
-    # 3. NVT equilibration (soft push-off)
-    # ------------------------------------------------------------------
-    print(f"\n[3/5] NVT equilibration ({n_equil} steps) ...")
-    reporter = StateDataReporter(
-        os.path.join(out_dir, "network_equil.log"), 10000,
-        step=True, potentialEnergy=True, temperature=True, speed=True
-    )
-    sim.reporters.append(reporter)
-    sim.step(n_equil)
-    sim.reporters.clear()
+    # Ramp: (dt, T_ramp, n_steps)
+    ramp = [
+        (0.001, 0.3,  20000),
+        (0.002, 0.6,  20000),
+        (0.004, 0.8,  30000),
+        (dt,    T,    n_equil),
+    ]
+    state = sim.context.getState(getPositions=True, getVelocities=True)
+    for dt_r, T_r, n_r in ramp:
+        integ = mm.LangevinMiddleIntegrator(T_r, gamma_m, dt_r)
+        integ.setRandomNumberSeed(seed)
+        try:
+            platform_obj = mm.Platform.getPlatformByName(platform)
+            props = {"CudaPrecision": "mixed"} if platform == "CUDA" else {}
+            sim_r = app.Simulation(dummy_topology(N), system, integ,
+                                   platform_obj, props)
+        except Exception:
+            sim_r = app.Simulation(dummy_topology(N), system, integ,
+                                   mm.Platform.getPlatformByName("CPU"))
+        sim_r.context.setState(state)
+        sim_r.context.setVelocitiesToTemperature(T_r)
+
+        reporter = app.StateDataReporter(
+            os.path.join(out_dir, f"network_equil_dt{dt_r:.3f}.log"),
+            max(1000, n_r // 20),
+            step=True, potentialEnergy=True, temperature=True, speed=True
+        )
+        sim_r.reporters.append(reporter)
+        sim_r.step(n_r)
+        ok, _ = check_energy(sim_r, f"dt={dt_r} T={T_r}")
+        if not ok:
+            raise RuntimeError(f"NaN at dt={dt_r}, T={T_r}")
+        state = sim_r.context.getState(getPositions=True, getVelocities=True)
+
     print("      NVT equilibration done")
 
-    # ------------------------------------------------------------------
-    # 4. (skipped) — no NPT barostat
-    # Paper 1 works entirely in NVT at fixed box L = (N_m/rho_m0)^(1/3).
-    # Density is set by construction; a barostat would change rho away
-    # from the target and has no well-defined P* = 0 in LJ units mapped
-    # to OpenMM real units.
-    # ------------------------------------------------------------------
-    print("\n[4/5] Skipping NPT — NVT at fixed box (Paper 1 protocol)")
-
+    # Use final sim_r for λ measurement
     # ------------------------------------------------------------------
     # 5. Measure λ
     # ------------------------------------------------------------------
-    print("\n[5/5] Measuring cross-link localization length λ ...")
-    lam_measured, msd_cl = measure_lambda(
-        sim, N_m, builder.L, n_msd_steps=100000, save_every=200, dt=dt
-    )
-    # Use Paper 1 reference value if close to a tabulated density
-    lam_ref, lam_ref_val = confinement_parameter(1.0, rho)   # just get lambda
-    print(f"      λ (measured) = {lam_measured:.4f} σ_m")
-    print(f"      λ (Paper 1 ref for ρ={rho}) = {lam_ref_val:.4f} σ_m")
+    print("\n[5/5] Measuring λ ...")
+    lam, msd_cl = measure_lambda(sim_r, N, L, dt=dt)
+    lam_ref = LAMBDA_REF.get(rho)
+    print(f"  λ measured = {lam:.4f}")
+    print(f"  λ Paper 1  = {lam_ref}  (rho={rho})")
 
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
-    pos_final = np.array(
-        sim.context.getState(getPositions=True).getPositions(asNumpy=True)
-    )
+    final_pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     np.savez(
         os.path.join(out_dir, "network_data.npz"),
-        positions=pos_final,
-        bonds=np.array(builder.all_bonds),
-        backbone_bonds=np.array(builder.backbone_bonds),
-        crosslink_bonds=np.array(builder.crosslink_bonds),
-        crosslink_ids=np.array(builder.crosslink_ids),
-        lambda_measured=lam_measured,
-        lambda_paper1=lam_ref_val,
-        msd_crosslink=msd_cl,
-        L=builder.L,
-        N_m=N_m,
-        rho=rho,
+        positions        = final_pos,
+        bonds            = np.array(builder.all_bonds),
+        backbone_bonds   = np.array(builder.backbone_bonds),
+        crosslink_bonds  = np.array(builder.crosslink_bonds),
+        crosslink_ids    = np.array(builder.crosslink_ids),
+        lambda_measured  = lam,
+        lambda_paper1    = lam_ref or 0.0,
+        msd_crosslink    = msd_cl,
+        L                = L,
+        N_m              = N,
+        rho              = rho,
     )
-    sim.saveCheckpoint(os.path.join(out_dir, "network_equilibrated.chk"))
-    print(f"\n  Saved network_data.npz and checkpoint to {out_dir}/")
+    sim_r.saveCheckpoint(os.path.join(out_dir, "network_equilibrated.chk"))
+    print(f"\n  Saved to {out_dir}/")
     print("  DONE — ready for 02_embed_enzymes.py")
 
 
