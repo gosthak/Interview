@@ -71,18 +71,26 @@ def main():
             "Run 01_build_network.py first."
         )
     net_data = np.load(net_path, allow_pickle=True)
-    net_positions = net_data["positions"]
     lam = float(net_data["lambda_paper1"])
-    L = float(net_data["L"])
+    L   = float(net_data["L"])
+    N_m_actual = int(net_data["N_m"])   # actual N after pruning in step 1
 
-    # Rebuild NetworkBuilder topology (needed for bond lists)
-    print("Rebuilding network topology for bond references ...")
-    builder = NetworkBuilder(N_m=N_m, rho=rho, c=c,
-                             mean_strand=mean_strand, seed=seed)
-    builder.build()
-    # Override positions with equilibrated ones
-    builder.positions = net_positions[:N_m].copy()
-    builder.L = L
+    # Load topology directly from saved data — no need to rebuild NetworkBuilder.
+    # Step 1 already saved the exact bonds and positions after pruning.
+    from src.network_builder import NetworkBuilder
+    builder = NetworkBuilder.__new__(NetworkBuilder)
+    builder.N_m          = N_m_actual
+    builder.L            = L
+    builder.rho          = rho
+    builder.c            = c
+    builder.mean_strand  = mean_strand
+    builder.positions    = net_data["positions"]          # equilibrated positions
+    builder.backbone_bonds  = [tuple(b) for b in net_data["backbone_bonds"]]
+    builder.crosslink_bonds = [tuple(b) for b in net_data["crosslink_bonds"]]
+    builder.crosslink_ids   = list(net_data["crosslink_ids"])
+    builder._cl_set      = set(builder.crosslink_ids)
+    builder._degree      = None
+    builder._update_degree = lambda: None   # not needed here
 
     print("=" * 60)
     print("CATCHY — Step 02: Embed enzymes")
@@ -108,7 +116,7 @@ def main():
         enz_sys.build()
 
         # Set network positions
-        all_pos = [mm.Vec3(*p) for p in net_positions[:N_m]]
+        all_pos = [mm.Vec3(*p) for p in builder.positions]
         # Placeholder enzyme positions (will be overwritten by embed_enzymes)
         for _ in range(enz_sys.N_E):
             all_pos.append(mm.Vec3(0, 0, 0))
