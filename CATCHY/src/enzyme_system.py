@@ -156,8 +156,9 @@ class EnzymeSystem:
         monomer_idx = list(range(self.N_m))
         enzyme_idx = list(range(self.N_m, self.N_m + self.N_E))
 
-        # 1. WCA between monomers
-        add_wca_monomers_only(self.system, self.N_m)
+        # 1. WCA between monomers — must register N_total particles
+        add_wca_monomers_only(self.system, self.N_m,
+                              n_total=self.N_m + self.N_E)
 
         # 2. FENE bonds (backbone + cross-links)
         all_bonds = self.network.all_bonds
