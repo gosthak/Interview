@@ -296,17 +296,20 @@ def main():
                 pos_wrapped = pos_nm % L_nm
                 # Convert to OpenMM Quantity in nm for PDBFile
                 pos_quantity = pos_wrapped * unit.nanometer
+                mm.app.PDBFile.writeFile(
+                    enz_sys.simulation.topology,
+                    pos_quantity,
+                    open(pdb_path, "w")
+                )
+                # Prepend CRYST1 record (box dimensions in Å)
+                L_ang = L_nm * 10.0
+                cryst1 = (
+                    f"CRYST1{L_ang:9.3f}{L_ang:9.3f}{L_ang:9.3f}"
+                    f"  90.00  90.00  90.00 P 1           1\n"
+                )
+                pdb_content = open(pdb_path).read()
                 with open(pdb_path, "w") as pdb_f:
-                    L_ang = L_nm * 10.0  # nm → Å
-                    pdb_f.write(
-                        f"CRYST1{L_ang:9.3f}{L_ang:9.3f}{L_ang:9.3f}"
-                        f"  90.00  90.00  90.00 P 1           1\n"
-                    )
-                    mm.app.PDBFile.writeFile(
-                        enz_sys.simulation.topology,
-                        pos_quantity,
-                        pdb_f
-                    )
+                    pdb_f.write(cryst1 + pdb_content)
                 print(f"  Topology saved → {pdb_path}")
 
             # Set up cleavage manager
