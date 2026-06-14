@@ -74,7 +74,7 @@ def run_production(enz_sys, cleavage_mgr, n_production, save_interval,
     # DCD reporter for VMD visualization
     dcd_path = os.path.join(out_dir, f"traj_{label}.dcd")
     enz_sys.simulation.reporters.append(
-        mm.app.DCDReporter(dcd_path, save_interval)
+        mm.app.DCDReporter(dcd_path, save_interval, enforcePeriodicBox=True)
     )
 
     n_blocks = n_production // save_interval
