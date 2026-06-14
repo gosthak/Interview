@@ -96,6 +96,7 @@ def run_production(enz_sys, cleavage_mgr, n_production, save_interval,
     survival_log = []
     step_log = []
     time_log = []
+    n_blocks = n_production // save_interval
 
     print(f"  Running {n_blocks} blocks × {save_interval} steps ...")
     t_wall = time.time()
