@@ -200,10 +200,3 @@ output/
     └── fig_G_enhancement.pdf
 ```
 
----
-
-## Contacts
-
-Virginie Hugouvieux — virginie.hugouvieux@inrae.fr  
-Xavier Frank — xavier.frank@inrae.fr  
-IATE lab, Université de Montpellier / INRAE
