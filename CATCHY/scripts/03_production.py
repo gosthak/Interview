@@ -71,7 +71,16 @@ def run_production(enz_sys, cleavage_mgr, n_production, save_interval,
         L=L
     )
 
-    # DCD reporter for VMD visualization
+    # Set box vectors in topology so DCDReporter writes them every frame
+    L_nm = enz_sys.L
+    box_vectors = (
+        mm.Vec3(L_nm, 0, 0) * mm.unit.nanometer,
+        mm.Vec3(0, L_nm, 0) * mm.unit.nanometer,
+        mm.Vec3(0, 0, L_nm) * mm.unit.nanometer,
+    )
+    enz_sys.simulation.topology.setPeriodicBoxVectors(box_vectors)
+
+    # DCD reporter for VMD
     dcd_path = os.path.join(out_dir, f"traj_{label}.dcd")
     enz_sys.simulation.reporters.append(
         mm.app.DCDReporter(dcd_path, save_interval, enforcePeriodicBox=True)
