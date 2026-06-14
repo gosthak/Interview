@@ -71,6 +71,12 @@ def run_production(enz_sys, cleavage_mgr, n_production, save_interval,
         L=L
     )
 
+    # DCD reporter for VMD visualization
+    dcd_path = os.path.join(out_dir, f"traj_{label}.dcd")
+    enz_sys.simulation.reporters.append(
+        mm.app.DCDReporter(dcd_path, save_interval)
+    )
+
     n_blocks = n_production // save_interval
     enzyme_positions_log = []   # for MSD computation
     survival_log = []
@@ -278,6 +284,17 @@ def main():
                     "Run 02_embed_enzymes.py first."
                 )
             enz_sys.load_checkpoint(chk_path)
+
+            # Save PDB topology for VMD (needed to load DCD)
+            pdb_path = os.path.join(out_dir, f"topology_{base_label}.pdb")
+            if not os.path.exists(pdb_path):
+                state = enz_sys.simulation.context.getState(getPositions=True)
+                mm.app.PDBFile.writeFile(
+                    enz_sys.simulation.topology,
+                    state.getPositions(),
+                    open(pdb_path, "w")
+                )
+                print(f"  Topology saved → {pdb_path}")
 
             # Set up cleavage manager
             if is_active:
