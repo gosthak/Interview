@@ -86,6 +86,17 @@ def run_production(enz_sys, cleavage_mgr, n_production, save_interval,
         mm.app.DCDReporter(dcd_path, save_interval, enforcePeriodicBox=True)
     )
 
+    # Log reporter — energy, temperature, speed
+    log_path = os.path.join(out_dir, f"production_{label}.log")
+    enz_sys.simulation.reporters.append(
+        mm.app.StateDataReporter(
+            log_path, save_interval,
+            step=True, potentialEnergy=True, kineticEnergy=True,
+            temperature=True, speed=True, progress=True,
+            totalSteps=n_production
+        )
+    )
+
     n_blocks = n_production // save_interval
     enzyme_positions_log = []   # for MSD computation
     survival_log = []
