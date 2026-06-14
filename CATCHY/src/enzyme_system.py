@@ -171,12 +171,14 @@ class EnzymeSystem:
         # 3. Expanded LJ — enzyme-monomer interaction (Paper 1 eq. 4)
         self.elj_force = add_expanded_lj(
             self.system, enzyme_idx, monomer_idx,
-            self.sigma_E, attractive=self.attractive
+            self.sigma_E, attractive=self.attractive,
+            box_length=self.L
         )
 
         # 4. WCA — enzyme-enzyme
         if self.N_E > 1:
-            add_enzyme_enzyme_wca(self.system, enzyme_idx, self.sigma_E)
+            add_enzyme_enzyme_wca(self.system, enzyme_idx, self.sigma_E,
+                                  box_length=self.L)
 
     def _build_simulation(self):
         """Build Langevin integrator and Simulation."""
@@ -191,14 +193,14 @@ class EnzymeSystem:
             if self.platform_name == "CUDA":
                 properties = {"CudaPrecision": "mixed"}
             self.simulation = mm.app.Simulation(
-                _dummy_topology(self.N_m + self.N_E),
+                _dummy_topology(self.N_m + self.N_E, self.N_m, self.N_E),
                 self.system, integrator, platform, properties
             )
         except Exception:
             print(f"[WARNING] Platform {self.platform_name} not available, falling back to CPU")
             platform = mm.Platform.getPlatformByName("CPU")
             self.simulation = mm.app.Simulation(
-                _dummy_topology(self.N_m + self.N_E),
+                _dummy_topology(self.N_m + self.N_E, self.N_m, self.N_E),
                 self.system, integrator, platform
             )
 
@@ -298,12 +300,27 @@ class EnzymeSystem:
 # Helper: minimal OpenMM Topology for a system with no chemistry
 # ---------------------------------------------------------------------------
 
-def _dummy_topology(N_total):
-    """Create a minimal Topology with N_total particles (no bonds, one chain)."""
-    import openmm.app as app
+def _dummy_topology(N_total, N_m=None, N_E=None):
+    """
+    Minimal Topology with monomers in chain 'A' (residue MON)
+    and enzymes in chain 'B' (residue ENZ).
+    If N_m/N_E not given, all particles go in one chain.
+    """
     topo = app.Topology()
-    chain = topo.addChain()
-    res = topo.addResidue("SYS", chain)
-    for i in range(N_total):
-        topo.addAtom(f"P{i}", app.element.carbon, res)
+    if N_m is None or N_E is None:
+        chain = topo.addChain("A")
+        res = topo.addResidue("MON", chain)
+        for i in range(N_total):
+            topo.addAtom(f"M{i}", app.element.carbon, res)
+    else:
+        # Monomers
+        chain_m = topo.addChain("A")
+        res_m = topo.addResidue("MON", chain_m)
+        for i in range(N_m):
+            topo.addAtom(f"M{i}", app.element.carbon, res_m)
+        # Enzymes
+        chain_e = topo.addChain("B")
+        res_e = topo.addResidue("ENZ", chain_e)
+        for i in range(N_E):
+            topo.addAtom(f"E{i}", app.element.phosphorus, res_e)
     return topo
