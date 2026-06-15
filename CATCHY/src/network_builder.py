@@ -49,7 +49,6 @@ class NetworkBuilder:
         self._assign_crosslinks()
         self._build_topology()
         self._prune_dangling()
-        self._unwrap_positions()
         self._verify()
         return self
 
@@ -139,21 +138,14 @@ class NetworkBuilder:
 
     def _build_topology(self):
         """
-        Build topology with unwrapped positions so bonded pairs are always
-        close WITHOUT PBC. Required by OpenMM CustomBondForce which does
-        not apply minimum image convention.
-
-        Key idea: when bonding atom j to atom i, immediately unwrap j to
-        the nearest image of i. Store these unwrapped positions so that
-        all bonds satisfy |pos[i] - pos[j]| < R0 without PBC.
+        Build topology using wrapped lattice positions.
+        FENE uses setUsesPeriodicBoundaryConditions(True) so minimum
+        image is applied automatically — no unwrapping needed.
         """
         L   = self.L
         N   = self.N_m
         cl_set = self._cl_set
         r_max = FENE_R0 * 1.3
-
-        # Unwrapped positions — modified as bonds are formed
-        pos_uw = self.positions.copy()
 
         nbrs = self._cell_list(r_max)
 
@@ -163,32 +155,20 @@ class NetworkBuilder:
         backbone_bonds = []
         crosslink_bonds = []
 
-        bonded = np.zeros(N, dtype=bool)   # True once atom is bonded to someone
-
         def try_bond(i, j):
             if valence_cur[i] >= valence_max[i]: return False
             if valence_cur[j] >= valence_max[j]: return False
             if i in cl_set and j in cl_set:      return False
             key = (min(i,j), max(i,j))
             if key in bond_set:                  return False
-            # Unwrap j to nearest image of i — but only if j not yet placed
-            old_pos_j = pos_uw[j].copy()
-            if not bonded[j]:
-                dr = pos_uw[j] - pos_uw[i]
-                dr -= L * np.round(dr / L)
-                pos_uw[j] = pos_uw[i] + dr
-            # Always use minimum image distance for the check
-            dr = pos_uw[j] - pos_uw[i]
+            # PBC distance — FENE uses minimum image automatically
+            dr = self.positions[i] - self.positions[j]
             dr -= L * np.round(dr / L)
-            r = np.linalg.norm(dr)
-            if r >= FENE_R0 * 0.95:   # strict threshold — well below singularity
-                pos_uw[j] = old_pos_j   # rollback
+            if np.linalg.norm(dr) >= FENE_R0:
                 return False
             bond_set.add(key)
             valence_cur[i] += 1
             valence_cur[j] += 1
-            bonded[i] = True
-            bonded[j] = True
             if i in cl_set or j in cl_set:
                 crosslink_bonds.append((i, j))
             else:
@@ -243,7 +223,6 @@ class NetworkBuilder:
 
         self.backbone_bonds = backbone_bonds
         self.crosslink_bonds = crosslink_bonds
-        self.positions = pos_uw   # save unwrapped positions
         self._update_degree()
 
     def _cell_list(self, r_cut):
