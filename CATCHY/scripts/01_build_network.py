@@ -98,7 +98,7 @@ def check_energy(sim, label="", builder=None):
             dr = pos[i] - pos[j]
             dr -= L * np.round(dr / L)
             r = float(np.linalg.norm(dr))
-            if r >= R0:
+            if r >= R0*0.9:
                 bad.append((idx, i, j, r))
         print(f"  Bonds >= R0 (PBC): {len(bad)}/{len(builder.all_bonds)}")
         for idx, i, j, r in bad[:5]:
@@ -211,7 +211,7 @@ def main():
     for idx, (i, j) in enumerate(builder.all_bonds):
         dr = pos[i] - pos[j]
         dr -= builder.L * np.round(dr / builder.L)
-        if np.linalg.norm(dr) >= FENE_R0:
+        if np.linalg.norm(dr) >= FENE_R0*0.9:
             bad_bond_indices.append(idx)
     if bad_bond_indices:
         print(f"  Removing {len(bad_bond_indices)} bonds >= R0 before minimization")
