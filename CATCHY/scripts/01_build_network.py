@@ -79,12 +79,30 @@ def make_simulation(N, L, bonds, gamma_m, T, dt, platform_name):
     return sim, system, fene
 
 
-def check_energy(sim, label=""):
+def check_energy(sim, label="", builder=None):
     state = sim.context.getState(getEnergy=True)
     e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
     import math
     ok = not (math.isnan(e) or math.isinf(e))
     print(f"  E {label}: {e:.2f} kJ/mol  {'OK' if ok else '<<< NaN/Inf !!!'}")
+    if not ok and builder is not None:
+        # Diagnose bond lengths from context
+        pos = sim.context.getState(getPositions=True)\
+              .getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        bv  = sim.context.getState(getPositions=True)\
+              .getPeriodicBoxVectors(asNumpy=True)
+        L   = float(bv[0][0].value_in_unit(unit.nanometer))
+        R0  = 1.5
+        bad = []
+        for idx, (i, j) in enumerate(builder.all_bonds):
+            r_nopbc = float(np.linalg.norm(pos[i] - pos[j]))
+            dr = pos[i] - pos[j]; dr -= L * np.round(dr/L)
+            r_pbc = float(np.linalg.norm(dr))
+            if r_nopbc >= R0:
+                bad.append((idx, i, j, r_nopbc, r_pbc))
+        print(f"  Bonds >= R0 without PBC: {len(bad)}/{len(builder.all_bonds)}")
+        for idx, i, j, r_no, r_p in bad[:5]:
+            print(f"    bond {idx}: ({i},{j}) r_nopbc={r_no:.3f} r_pbc={r_p:.3f}")
     return ok, e
 
 
@@ -168,7 +186,7 @@ def main():
         N, L, builder.all_bonds, gamma_m, T, dt, platform
     )
     sim.context.setPositions([mm.Vec3(*p) for p in pos])
-    ok, _ = check_energy(sim, "before minimization")
+    ok, _ = check_energy(sim, "before minimization", builder)
     print("      System built")
 
     # ------------------------------------------------------------------
@@ -176,7 +194,7 @@ def main():
     # ------------------------------------------------------------------
     print("\n[3/5] Energy minimization ...")
     sim.minimizeEnergy(maxIterations=10000)
-    ok, _ = check_energy(sim, "after minimization")
+    ok, _ = check_energy(sim, "after minimization", builder)
     if not ok:
         raise RuntimeError("Energy is NaN after minimization. Check topology.")
 
