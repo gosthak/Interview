@@ -86,7 +86,7 @@ def check_energy(sim, label="", builder=None):
     ok = not (math.isnan(e) or math.isinf(e))
     print(f"  E {label}: {e:.2f} kJ/mol  {'OK' if ok else '<<< NaN/Inf !!!'}")
     if not ok and builder is not None:
-        # Diagnose bond lengths from context
+        # Diagnose bond lengths via PBC (matches FENE with PBC)
         pos = sim.context.getState(getPositions=True)\
               .getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         bv  = sim.context.getState(getPositions=True)\
@@ -95,14 +95,14 @@ def check_energy(sim, label="", builder=None):
         R0  = 1.5
         bad = []
         for idx, (i, j) in enumerate(builder.all_bonds):
-            r_nopbc = float(np.linalg.norm(pos[i] - pos[j]))
-            dr = pos[i] - pos[j]; dr -= L * np.round(dr/L)
-            r_pbc = float(np.linalg.norm(dr))
-            if r_nopbc >= R0:
-                bad.append((idx, i, j, r_nopbc, r_pbc))
-        print(f"  Bonds >= R0 without PBC: {len(bad)}/{len(builder.all_bonds)}")
-        for idx, i, j, r_no, r_p in bad[:5]:
-            print(f"    bond {idx}: ({i},{j}) r_nopbc={r_no:.3f} r_pbc={r_p:.3f}")
+            dr = pos[i] - pos[j]
+            dr -= L * np.round(dr / L)
+            r = float(np.linalg.norm(dr))
+            if r >= R0:
+                bad.append((idx, i, j, r))
+        print(f"  Bonds >= R0 (PBC): {len(bad)}/{len(builder.all_bonds)}")
+        for idx, i, j, r in bad[:5]:
+            print(f"    bond {idx}: ({i},{j}) r_pbc={r:.3f}")
     return ok, e
 
 
@@ -124,29 +124,6 @@ def measure_lambda(sim, N, L, n_steps=80000, save_every=200, dt=0.006):
 
 
 
-def repair_fene_bonds_no_pbc(pos, bonds, target=0.9*1.5, R0=1.5, max_iter=20):
-    """
-    Repair FENE bonds that exceed R0 in unwrapped (no-PBC) coordinates.
-    Moves bonded pairs toward each other until all r_nopbc < R0.
-    This is what the minimizer sees — FENE without PBC.
-    """
-    pos = pos.copy()
-    for _ in range(max_iter):
-        n_bad = 0
-        for i, j in bonds:
-            dr = pos[j] - pos[i]
-            r = np.linalg.norm(dr)
-            if r >= R0:
-                n_bad += 1
-                if r == 0:
-                    continue
-                mid = 0.5 * (pos[i] + pos[j])
-                direction = dr / r
-                pos[i] = mid - 0.5 * target * direction
-                pos[j] = mid + 0.5 * target * direction
-        if n_bad == 0:
-            break
-    return pos
 
 
 def main():
@@ -224,20 +201,6 @@ def main():
     # 3. Minimization
     # ------------------------------------------------------------------
     print("\n[3/5] Energy minimization ...")
-    # Repair FENE bonds in no-PBC unwrapped coordinates before minimization.
-    # This is what the minimizer sees — must have r_nopbc < R0 for all bonds.
-    pos = repair_fene_bonds_no_pbc(pos, builder.all_bonds)
-
-    # Verify no bad bonds remain
-    bl_nopbc = np.array([np.linalg.norm(pos[i] - pos[j])
-                         for i, j in builder.all_bonds])
-    n_bad = int((bl_nopbc >= 1.5).sum())
-    print(f"  Bond check no-PBC after repair: "
-          f"min={bl_nopbc.min():.4f}  max={bl_nopbc.max():.4f}  "
-          f"bonds>=R0: {n_bad}")
-    if n_bad > 0:
-        raise RuntimeError(f"{n_bad} bonds still >= R0 after repair.")
-
     sim.context.setPositions([mm.Vec3(*p) for p in pos])
     ok, _ = check_energy(sim, "before minimization", builder)
 
