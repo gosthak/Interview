@@ -123,6 +123,32 @@ def measure_lambda(sim, N, L, n_steps=80000, save_every=200, dt=0.006):
     return lam, msd
 
 
+
+def repair_fene_bonds_no_pbc(pos, bonds, target=0.9*1.5, R0=1.5, max_iter=20):
+    """
+    Repair FENE bonds that exceed R0 in unwrapped (no-PBC) coordinates.
+    Moves bonded pairs toward each other until all r_nopbc < R0.
+    This is what the minimizer sees — FENE without PBC.
+    """
+    pos = pos.copy()
+    for _ in range(max_iter):
+        n_bad = 0
+        for i, j in bonds:
+            dr = pos[j] - pos[i]
+            r = np.linalg.norm(dr)
+            if r >= R0:
+                n_bad += 1
+                if r == 0:
+                    continue
+                mid = 0.5 * (pos[i] + pos[j])
+                direction = dr / r
+                pos[i] = mid - 0.5 * target * direction
+                pos[j] = mid + 0.5 * target * direction
+        if n_bad == 0:
+            break
+    return pos
+
+
 def main():
     args  = parse_args()
     cfg   = load_config(args.config)
@@ -187,20 +213,34 @@ def main():
     # 2. Build OpenMM system
     # ------------------------------------------------------------------
     print("\n[2/5] Building OpenMM system ...")
-    print("\n[2/5] Building OpenMM system ...")
     # FENE uses PBC (setUsesPeriodicBoundaryConditions=True)
     # so minimum image is applied automatically.
     sim, system, fene = make_simulation(
         N, L, builder.all_bonds, gamma_m, T, dt, platform
     )
     sim.context.setPositions([mm.Vec3(*p) for p in pos])
-    ok, _ = check_energy(sim, "before minimization", builder)
-    print("      System built")
 
     # ------------------------------------------------------------------
     # 3. Minimization
     # ------------------------------------------------------------------
     print("\n[3/5] Energy minimization ...")
+    # Repair FENE bonds in no-PBC unwrapped coordinates before minimization.
+    # This is what the minimizer sees — must have r_nopbc < R0 for all bonds.
+    pos = repair_fene_bonds_no_pbc(pos, builder.all_bonds)
+
+    # Verify no bad bonds remain
+    bl_nopbc = np.array([np.linalg.norm(pos[i] - pos[j])
+                         for i, j in builder.all_bonds])
+    n_bad = int((bl_nopbc >= 1.5).sum())
+    print(f"  Bond check no-PBC after repair: "
+          f"min={bl_nopbc.min():.4f}  max={bl_nopbc.max():.4f}  "
+          f"bonds>=R0: {n_bad}")
+    if n_bad > 0:
+        raise RuntimeError(f"{n_bad} bonds still >= R0 after repair.")
+
+    sim.context.setPositions([mm.Vec3(*p) for p in pos])
+    ok, _ = check_energy(sim, "before minimization", builder)
+
     sim.minimizeEnergy(maxIterations=10000)
     ok, _ = check_energy(sim, "after minimization", builder)
     if not ok:
