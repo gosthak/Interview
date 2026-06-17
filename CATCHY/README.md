@@ -151,7 +151,7 @@ E_c  = 4ε[(σ_m/r_c)^12 − (σ_m/r_c)^6]   (continuity shift)
 
 Enzyme mass and friction scale with volume: m_E = m(σ_E/σ_m)³,  γ_E = γ_m(σ_m/σ_E)².
 
-### Enzymatic cleavage — new in CATCHY
+### Enzymatic cleavage — new
 
 Every `check_interval` MD steps, `CleavageManager` checks each intact cross-link bond:
 
